@@ -565,7 +565,7 @@ static struct configdata config[] =
       NULL },
     { TYPE_INT, 0, MAX_SLIDES_COUNT, { .int_p = &pf_cfg.num_slides }, "slides count",
       NULL },
-    { TYPE_INT, 0, 300, { .int_p = &pf_cfg.zoom }, "zoom", NULL },
+    { TYPE_INT, 10, 300, { .int_p = &pf_cfg.zoom }, "zoom", NULL },
     { TYPE_BOOL, 0, 1, { .bool_p = &pf_cfg.show_fps }, "show fps", NULL },
     { TYPE_BOOL, 0, 1, { .bool_p = &pf_cfg.resize }, "resize", NULL },
     { TYPE_INT, 0, 100, { .int_p = &pf_cfg.cache_version }, "cache version", NULL },
@@ -3228,6 +3228,8 @@ static void render_slide(struct slide_data *slide, const int alpha)
     const int p_start_lower = (sh - display_offs) * PFREAL_ONE;
     const int plim2_max = MIN(sh + reflect_height, sh * 2) * PFREAL_ONE;
     for (x = xi; x < w; x++) {
+        if (xs < slide_left)
+            xs = slide_left;
         int column = (unsigned)(xs - slide_left) >> PFREAL_SHIFT;
         if (column >= sw)
             break;
@@ -3437,10 +3439,28 @@ static bool sort_albums(int new_sorting, bool from_settings)
 /**
   Start the animation for changing slides
  */
+/* The flip advances by elapsed time, not by frame count. speed is
+ * calibrated per frame at this nominal rate; anything slower simply
+ * takes bigger steps rather than taking longer. */
+#define PF_NOMINAL_FPS 30
+
+static long pf_anim_last_tick;
+static int  pf_anim_frac;
+
 static void start_animation(void)
 {
     step = (target < center_slide.slide_index) ? -1 : 1;
+    /* While idle slide_frame sits exactly on a slide boundary. For
+     * step < 0 the centre is derived as (slide_frame >> 16) + 1, so
+     * index<<16 already belongs to the slide above it -- the counter
+     * has to start one unit inside the interval that maps to the
+     * current centre, or the first evaluation snaps the centre to the
+     * slide on the right. */
+    if (step < 0)
+        slide_frame = (center_index << 16) - 1;
     pf_state = pf_scrolling;
+    pf_anim_last_tick = *rb->current_tick;
+    pf_anim_frac = 0;
 }
 
 static void update_scroll_animation(void);
@@ -3617,7 +3637,53 @@ static void update_scroll_animation(void)
               + accel * pf_cfg.scroll_speed / 100;
     }
 
-    slide_frame += speed * step;
+    /* Advance by wall-clock, not per call. render_all_slides() cost
+     * varies with the settings -- turning parallel slides off widens
+     * the side slides and adds roughly a fifth to the pixel work -- and
+     * with a per-frame advance that showed up twice: fewer frames per
+     * second, and a flip that took proportionally longer because it
+     * still needed the same number of frames. Only the frame rate
+     * should move.
+     *
+     * The remainder is carried because HZ is 100, so a ~30ms frame is
+     * about three ticks and truncating each one would make the step
+     * size jitter by a third.
+     */
+    {
+        long now = *rb->current_tick;
+        int dt = now - pf_anim_last_tick;
+        int num, adv;
+
+        pf_anim_last_tick = now;
+        if (dt < 0)
+            dt = 0;
+        if (dt > HZ / 5)
+            dt = HZ / 5;    /* a stall must not teleport the flip */
+
+        num = speed * dt * PF_NOMINAL_FPS + pf_anim_frac;
+        adv = num / HZ;
+        pf_anim_frac = num - adv * HZ;
+
+        /* dt is clamped but adv is not. speed reaches 133120 and the
+         * clamp is 20 ticks, so one call can advance 798720 -- over
+         * twelve slides -- while target is never more than two away. A
+         * long frame would sail past it, the direction test at the end
+         * of this function would throw the flip into reverse, and
+         * center_index would meanwhile index pf_idx.album_index[] out
+         * of bounds in draw_album_text(), which does not range-check.
+         * Never advance beyond the target; for step < 0 stop one unit
+         * short so that (slide_frame >> 16) + 1 == target. */
+        {
+            int remain = (step < 0) ? slide_frame - (target << 16) + 1
+                                    : (target << 16) - slide_frame;
+            if (remain < 0)
+                remain = 0;
+            if (adv > remain)
+                adv = remain;
+        }
+
+        slide_frame += adv * step;
+    }
 
     int index = slide_frame >> 16;
     int pos = slide_frame & 0xffff;
@@ -3633,11 +3699,13 @@ static void update_scroll_animation(void)
     if (center_index != index) {
         center_index = index;
         rb->queue_post(&thread_q, EV_WAKEUP, 0);
-        slide_frame = index << 16;
+        /* Same one-unit offset as in start_animation(): index<<16 is
+         * the top of the step < 0 interval, not the bottom. */
+        slide_frame = (index << 16) - (step < 0 ? 1 : 0);
         /* Recalculate pos/tick/ftick/fade for the snapped slide_frame.
          * Without this, stale pre-snap values cause a one-frame alpha
          * discontinuity (flash) at boundary crossings. */
-        pos = (step < 0) ? 65535 : 0;
+        pos = slide_frame & 0xffff;
         neg = 65536 - pos;
         tick = (step < 0) ? neg : pos;
         ftick = (tick * PFREAL_ONE) >> 16;
@@ -4133,15 +4201,43 @@ static void reverse_animation(void)
 /**
    Draw the selection highlight bar at y with height h
  */
-static inline void draw_gradient(int y, int h)
+/* Decorate the selected track row and leave the LCD ready to draw its
+ * text, so the track list agrees with the menus for whatever "selector
+ * type" is set. See apps/gui/bitmap/list.c:408-434 -- a flat selector
+ * start colour is only correct for "bar (color)"; the default on colour
+ * targets is "bar (gradient)", and the two remaining modes use the
+ * foreground/background pair instead. PictureFlow's own menus go
+ * through rb->do_menu() and already honour the setting, so before this
+ * the track list disagreed with the menus in the same plugin.
+ *
+ * The text state is set here rather than at the call site so the mode
+ * is classified exactly once. put_line() is handed an empty string --
+ * it decorates the row without drawing text -- which means the core
+ * returns before put_text() and never sets the text draw mode, and
+ * vput_line() leaves DRMODE_SOLID behind. Both bar modes therefore
+ * need DRMODE_FG set explicitly or the text stamps an opaque box over
+ * the bar just drawn.
+ */
+static inline void draw_track_selector(int y, int h)
 {
 #ifdef HAVE_LCD_COLOR
     /* Apple2026: flat bar matches WPSLIST selector E5E5EA (no gradient) */
     mylcd_set_foreground(N_PIX(229, 229, 234));
     mylcd_fillrect(0, y, LCD_WIDTH, h);
+    /* Upstream contract: leave fg + draw mode ready for the row text */
+    mylcd_set_foreground(pf_lst_color);
+    mylcd_set_drawmode(DRMODE_FG);
 #else
-    mylcd_set_foreground(G_BRIGHT(160));
-    mylcd_fillrect(0, y, LCD_WIDTH, h);
+    int r, inc, c;
+    inc = (100 << 8) / h;
+    c = 0;
+    for (r = 0; r < h; r++) {
+        int bright = (r > h/2) ? (h - r) : r;
+        bright = bright * 255 / (h/2);
+        mylcd_set_foreground(G_BRIGHT(160 * bright / 255));
+        mylcd_hline(0, LCD_WIDTH, r + y);
+    }
+    mylcd_set_foreground(G_BRIGHT(255));
 #endif
 }
 
@@ -4316,8 +4412,12 @@ static void focus_playing_track_once(void)
 static void draw_album_text(void);
 static void show_track_list_loading(void)
 {
-    int msg_w = mylcd_getstringsize(rb->str(LANG_WAIT), NULL, NULL);
-    int x = (LCD_WIDTH - msg_w) / 2;
+#ifdef HAVE_LCD_COLOR
+    mylcd_set_background(pf_bg_color);
+#else
+    mylcd_set_background(G_BRIGHT(0));
+#endif
+    int x = (LCD_WIDTH - mylcd_getstringsize(rb->str(LANG_WAIT), NULL, NULL)) / 2;
 #ifdef HAVE_LCD_COLOR
     mylcd_set_foreground(pf_fg_color);
 #else
@@ -4355,6 +4455,11 @@ static void show_track_list_loading(void)
  */
 static bool show_track_list(void)
 {
+#ifdef HAVE_LCD_COLOR
+    mylcd_set_background(pf_bg_color);
+#else
+    mylcd_set_background(G_BRIGHT(0));
+#endif
     pf_clear_display();
     if ( center_slide.slide_index != pf_tracks.cur_idx ) {
         if (rb->global_settings->storage_mode != 2
@@ -4395,13 +4500,9 @@ static bool show_track_list(void)
                 set_scroll_line(trackname, PF_SCROLL_TRACK);
                 pf_tracks.last_sel = pf_tracks.sel;
             }
-            draw_gradient(titletxt_y, titletxt_h);
+            /* Also leaves the fg/bg and draw mode set for the text. */
+            draw_track_selector(titletxt_y, titletxt_h);
             titletxt_x = get_scroll_line_offset(PF_SCROLL_TRACK);
-#ifdef HAVE_LCD_COLOR
-            mylcd_set_foreground(pf_lst_color);
-#else
-            mylcd_set_foreground(G_BRIGHT(255));
-#endif
         }
         else {
             titletxt_w = mylcd_getstringsize(trackname, NULL, NULL);
@@ -4415,6 +4516,13 @@ static bool show_track_list(void)
 #endif
         }
         mylcd_putsxy(titletxt_x,titletxt_y,trackname);
+#ifdef HAVE_LCD_COLOR
+        /* Back to foreground-only. DRMODE_SOLID is BG|FG, which paints
+         * an opaque box behind every subsequent string -- including the
+         * album and artist drawn over the covers once the track list
+         * closes. Everything else in this plugin uses DRMODE_FG. */
+        mylcd_set_drawmode(DRMODE_FG);
+#endif
         titletxt_y += titletxt_h;
     }
 
