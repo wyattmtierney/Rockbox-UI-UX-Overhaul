@@ -85,12 +85,6 @@ static struct gui_skin {
     bool                needs_full_update;
 } skins[SKINNABLE_SCREENS_COUNT][NB_SCREENS];
 
-static signed char hold_state_cache[SKINNABLE_SCREENS_COUNT][NB_SCREENS] = {
-    [0 ... SKINNABLE_SCREENS_COUNT - 1] = {
-        [0 ... NB_SCREENS - 1] = -1
-    }
-};
-
 int skin_get_num_skins(void)
 {
     return SKINNABLE_SCREENS_COUNT;
@@ -346,33 +340,18 @@ bool skin_do_full_update(enum skinnable_screens skin,
                             enum screen_type screen)
 {
     struct viewport *vp = *(screens[screen].current_viewport);
-    bool hold_changed = false;
 
     bool vp_is_dirty = ((vp->flags & VP_FLAG_VP_SET_CLEAN) == VP_FLAG_VP_DIRTY) &&
                        get_current_activity() == ACTIVITY_WPS;
 
-#if defined(HAVE_TOUCHSCREEN) || defined(HAS_BUTTON_HOLD)
-    if (screen == SCREEN_MAIN)
-    {
-        bool held = false;
-#ifdef HAVE_TOUCHSCREEN
-        held = skins[skin][screen].data.touchscreen_locked;
-#endif
-#ifdef HAS_BUTTON_HOLD
-        held = held || button_hold();
-#endif
-        if (hold_state_cache[skin][screen] < 0)
-            hold_state_cache[skin][screen] = held;
-        else if (hold_state_cache[skin][screen] != held)
-        {
-            hold_state_cache[skin][screen] = held;
-            hold_changed = true;
-        }
-    }
-#endif
+    /* Hold-switch changes must NOT force a full skin redraw here. The
+     * %?mh conditional already redraws its own branch when the value
+     * changes; forcing SKIN_REFRESH_ALL makes the SBS clear and re-hide
+     * its %Vd header viewports out of step with the list, which blanked
+     * the header for ~1s on every hold toggle and showed the lock icon
+     * only after unlocking. */
 
-    bool ret = (skins[skin][screen].needs_full_update || vp_is_dirty ||
-                hold_changed);
+    bool ret = (skins[skin][screen].needs_full_update || vp_is_dirty);
     skins[skin][screen].needs_full_update = false;
     return ret;
 }
