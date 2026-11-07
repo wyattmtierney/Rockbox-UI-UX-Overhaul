@@ -1006,6 +1006,15 @@ int32_t audiohw_get_pitch(void)         { return 0; }
 /* command 0x0C -- an accessory sends RDS payloads and the driver has   */
 /* to hand the right bytes and length to the RDS layer.                 */
 /* ------------------------------------------------------------------ */
+int find_first_set_bit(uint32_t val)
+{
+    if (val == 0)
+        return 32;
+    int n = 0;
+    while (!(val & 1)) { val >>= 1; n++; }
+    return n;
+}
+
 #if CONFIG_TUNER
 
 #include "rds.h"
@@ -1049,13 +1058,5 @@ void rds_push_info(enum rds_info_id info_id, uintptr_t data, size_t size)
 
 unsigned short adc_read(int channel) { (void)channel; return 0; }
 
-int find_first_set_bit(uint32_t val)
-{
-    if (val == 0)
-        return 32;
-    int n = 0;
-    while (!(val & 1)) { val >>= 1; n++; }
-    return n;
-}
 
 #endif /* CONFIG_TUNER */

@@ -23,7 +23,7 @@
 #define FILEFUNCTIONS_DEFINED
 
 /* GNU extension used by firmware/include/string-extra.h, absent on macOS. */
-#ifndef HAVE_MEMPCPY
+#if !defined(HAVE_MEMPCPY) && defined(__APPLE__)
 #define HAVE_MEMPCPY
 static inline void *mempcpy(void *d, const void *s, size_t n)
 {
